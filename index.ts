@@ -3,10 +3,12 @@ import { StringSession } from 'telegram/sessions'
 import { NewMessage, NewMessageEvent } from 'telegram/events'
 import { Api } from 'telegram/tl'
 import OpenAI from 'openai'
-import 'dotenv/config'
+import * as dotenv from 'dotenv'
 import input from 'input'
 
 // Load environment variables from .env file
+dotenv.config()
+
 // --- Configuration ---
 const apiId = parseInt(process.env.API_ID || '')
 const apiHash = process.env.API_HASH || ''
@@ -16,6 +18,9 @@ const chatIds = (process.env.CHAT_IDS || '')
   .map((id) => BigInt(id.trim()))
 const ignoreUserId = BigInt(process.env.IGNORE_USER_ID || '0')
 const openrouterApiKey = process.env.OPENAI_API_KEY || ''
+const reservationMessage =
+  process.env.RESERVATION_MESSAGE ||
+  "Hello, I'm interested in this item and would like to reserve it."
 
 // --- OpenAI Client Initialization (using OpenRouter) ---
 const openai = new OpenAI({
@@ -24,8 +29,9 @@ const openai = new OpenAI({
 })
 
 // --- Type Definition for Parsed Data ---
-interface ParsedItem {
-  item: string | null
+export interface ParsedItem {
+  item_name: string | null
+  category: 'furniture' | 'electronics' | 'clothing' | 'other' | null
   price: number | string | null
   location: string | null
   is_free: boolean
@@ -38,10 +44,15 @@ const itemSchema = {
   schema: {
     type: 'object',
     properties: {
-      item: {
+      item_name: {
         type: 'string',
         description:
-          'The name or a brief description of the item being offered.'
+          'The specific name of the item being offered (e.g., "IKEA Sofa", "TV Stand").'
+      },
+      category: {
+        type: 'string',
+        description: 'The category of the item.',
+        enum: ['furniture', 'electronics', 'clothing', 'other']
       },
       price: {
         type: ['number', 'string'],
@@ -59,7 +70,7 @@ const itemSchema = {
           'Set to true if the item is explicitly offered for free or "даром", otherwise false.'
       }
     },
-    required: ['item', 'price', 'location', 'is_free'],
+    required: ['item_name', 'category', 'price', 'location', 'is_free'],
     additionalProperties: false
   }
 }
@@ -79,8 +90,8 @@ export async function analyzeMessageWithOpenAI(
 
   const prompt = `
         Analyze the following message and extract the details of the item being offered according to the provided JSON schema.
-        There a chance that message will be a request to buy something, such request should be ignored.
-        If the price is "free", "отдам даром", or similar, the 'is_free' flag must be true and the price should be 0.
+        - The category should be one of the enum values.
+        - If the price is "free", "отдам даром", or similar, the 'is_free' flag must be true and the price should be 0.
         
         Message: "${messageText}"
     `
@@ -110,7 +121,6 @@ export async function analyzeMessageWithOpenAI(
     const result = response.choices[0]?.message?.content
     if (result) {
       console.log('OpenAI Raw Response:', result)
-      // The response should already be a valid JSON string because of the schema
       const parsedData: ParsedItem = JSON.parse(result)
       return parsedData
     }
@@ -122,10 +132,61 @@ export async function analyzeMessageWithOpenAI(
 }
 
 /**
+ * Checks if an item meets the specified criteria for sending a reservation message.
+ * @param item The parsed item data.
+ * @returns True if the item meets the criteria, false otherwise.
+ */
+export function doesItemMeetCriteria(item: ParsedItem): boolean {
+  const { item_name, category, price, location } = item
+
+  // Price check: less than 40 or free
+  const priceIsRight = (typeof price === 'number' && price < 40) || item.is_free
+
+  // Category check
+  const categoryIsRight = category === 'furniture'
+
+  // Location check (case-insensitive)
+  const locationIsRight =
+    location?.toLowerCase().includes('limassol') ||
+    location?.toLowerCase().includes('лимассол')
+
+  // Item name check (case-insensitive)
+  const nameIsRight =
+    item_name &&
+    (item_name.toLowerCase().includes('tv stand') ||
+      item_name.toLowerCase().includes('тумбочка') ||
+      item_name.toLowerCase().includes('телевизор'))
+
+  return Boolean(
+    priceIsRight && categoryIsRight && locationIsRight && nameIsRight
+  )
+}
+
+/**
+ * Sends a private message to a user.
+ * @param client The TelegramClient instance.
+ * @param userId The ID of the user to send the message to.
+ * @param message The message to send.
+ */
+async function sendReservationMessage(
+  client: TelegramClient,
+  userId: any,
+  message: string
+) {
+  try {
+    const entity = await client.getEntity(userId)
+    console.log(`Sending reservation message to user ${userId}...`)
+    await client.sendMessage(entity, { message })
+    console.log('Reservation message sent successfully.')
+  } catch (error) {
+    console.error(`Failed to send message to user ${userId}:`, error)
+  }
+}
+
+/**
  * Main function to initialize the Telegram client and start listening for messages.
  */
 async function main() {
-  // Check for essential environment variables
   if (!apiId || !apiHash || !openrouterApiKey) {
     console.error(
       'Essential environment variables (API_ID, API_HASH, OPENROUTER_API_KEY) are missing. Exiting.'
@@ -147,7 +208,6 @@ async function main() {
   })
 
   console.log('You should now be connected.')
-  // The session string is saved automatically by the client.
   if (!process.env.SESSION) {
     console.log(
       'Save this session string to your .env file to avoid logging in again:'
@@ -172,7 +232,6 @@ async function main() {
     } else {
       return
     }
-    console.log('chatId: ', chatId, ', message.text: ', message.text)
 
     if (!chatIds.includes(chatId)) return
 
@@ -192,11 +251,18 @@ async function main() {
 
     if (parsedData) {
       console.log('--- Parsed Item Log ---')
-      console.log(`Item: ${parsedData.item}`)
+      console.log(`Item Name: ${parsedData.item_name}`)
+      console.log(`Category: ${parsedData.category}`)
       console.log(`Price: ${parsedData.price}`)
       console.log(`Location: ${parsedData.location}`)
       console.log(`Is Free: ${parsedData.is_free}`)
       console.log('-----------------------')
+
+      // Check if the item meets the criteria and send a message
+      if (doesItemMeetCriteria(parsedData)) {
+        console.log('Item meets reservation criteria!')
+        await sendReservationMessage(client, senderId, reservationMessage)
+      }
     } else {
       console.log('Could not parse data from the message.')
     }
